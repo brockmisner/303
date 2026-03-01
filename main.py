@@ -120,6 +120,15 @@ WINDOW_SPEND_CAP_USD       = float(os.getenv("WINDOW_SPEND_CAP_USD", "999999.0")
 POLY_BOOK_MAX_AGE_MS       = int(os.getenv("POLY_BOOK_MAX_AGE_MS", "15000"))
 POLY_BOOK_RESEED_AHEAD_MS  = int(os.getenv("POLY_BOOK_RESEED_AHEAD_MS", "4000"))
 
+# EV attribution + online calibration knobs
+EXEC_LEAKAGE_WARN = float(os.getenv("EXEC_LEAKAGE_WARN", "0.30"))
+CAL_EDGE_BASE_SHIFT = float(os.getenv("CAL_EDGE_BASE_SHIFT", "0.0"))
+CAL_MIN_P_BASE_SHIFT = float(os.getenv("CAL_MIN_P_BASE_SHIFT", "0.0"))
+CAL_MAX_PAY_BASE_SHIFT = float(os.getenv("CAL_MAX_PAY_BASE_SHIFT", "0.0"))
+CAL_DOWN_EDGE_BONUS = float(os.getenv("CAL_DOWN_EDGE_BONUS", "0.003"))
+CAL_DOWN_MIN_P_BONUS = float(os.getenv("CAL_DOWN_MIN_P_BONUS", "0.008"))
+CALIBRATION_LOG_FILE = os.getenv("CALIBRATION_LOG_FILE", "logs/ev_calibration.csv")
+
 # Oracle staleness thresholds
 RTDS_FRESH_MS        = 45_000   # RTDS considered fresh if < 45s old
 COINBASE_STALE_MS    = 5_000    # Binance takes over if Coinbase > 5s stale
@@ -870,6 +879,74 @@ def dynamic_z_min(regime_label: str, sigma: float) -> float:
 def flow_size_scale(flow: float) -> float:
     """Contra flow reduces size, never blocks. |flow|=0→1.0, =0.9→0.28."""
     return max(0.25, min(1.0, 1.0 - abs(flow) * 0.8))
+
+
+def state_calibration_adjustments(*, side: str, sec_remaining: float,
+                                  spread: float, lag_p50_ms: float,
+                                  sigma_ratio: float) -> dict:
+    """Lightweight state-conditioned threshold shifts (runtime calibration scaffold)."""
+    edge_shift = CAL_EDGE_BASE_SHIFT
+    min_p_shift = CAL_MIN_P_BASE_SHIFT
+    max_pay_shift = CAL_MAX_PAY_BASE_SHIFT
+
+    if sec_remaining <= 60:
+        edge_shift += 0.004
+    elif sec_remaining >= 180:
+        edge_shift -= 0.001
+
+    if spread > 0.06:
+        edge_shift += 0.004
+        max_pay_shift -= 0.010
+    elif spread < 0.03:
+        edge_shift -= 0.001
+        max_pay_shift += 0.005
+
+    if lag_p50_ms > 900:
+        edge_shift += 0.003
+        min_p_shift += 0.005
+    elif lag_p50_ms < 450:
+        edge_shift -= 0.001
+
+    if sigma_ratio > 1.5:
+        edge_shift += 0.002
+    elif sigma_ratio < 0.8:
+        min_p_shift += 0.004
+
+    if side == "DOWN":
+        edge_shift += CAL_DOWN_EDGE_BONUS
+        min_p_shift += CAL_DOWN_MIN_P_BONUS
+
+    return {
+        "edge_boost": round(edge_shift, 5),
+        "min_p_shift": round(min_p_shift, 5),
+        "max_pay_shift": round(max_pay_shift, 5),
+    }
+
+
+def quality_score(edge: float, spread: float, p_fill: float, lag_p50_ms: float) -> float:
+    """Execution-aware quality score in [0,1] used for Kelly banding."""
+    e = max(0.0, min(1.0, edge / 0.08))
+    sp = max(0.0, min(1.0, 1.0 - spread / 0.08))
+    pf = max(0.0, min(1.0, p_fill))
+    lag = max(0.0, min(1.0, 1.0 - lag_p50_ms / 1500.0))
+    return 0.40 * e + 0.20 * sp + 0.25 * pf + 0.15 * lag
+
+
+def log_calibration_sample(*, side: str, t_bucket: str, spread: float, lag_ms: float,
+                           sigma_ratio: float, edge: float, p_token: float,
+                           ask: float, reason: str) -> None:
+    """Append per-signal sample for nightly threshold recalibration jobs."""
+    try:
+        _new = not os.path.exists(CALIBRATION_LOG_FILE)
+        with open(CALIBRATION_LOG_FILE, "a", newline="") as f:
+            w = csv.writer(f)
+            if _new:
+                w.writerow(["ts_ms", "side", "t_bucket", "spread", "lag_ms", "sigma_ratio",
+                            "edge", "p_token", "ask", "reason"])
+            w.writerow([ms_now(), side, t_bucket, f"{spread:.5f}", f"{lag_ms:.1f}",
+                        f"{sigma_ratio:.3f}", f"{edge:.5f}", f"{p_token:.5f}", f"{ask:.4f}", reason])
+    except Exception as e:
+        logger.debug(f"CALIB_LOG_SKIP: {e}")
 
 
 # ── Position State ──────────────────────────────────────────────────────────
@@ -2105,11 +2182,11 @@ async def execution_loop() -> None:
             _exec_T = float(STATE.sec_remaining)
             _use_adaptive = (
                 ADAPTIVE_EXEC is not None
-                and _exec_regime in ("CALM", "NORMAL")
                 and order_side == "BUY"
-                and _exec_T > 60.0
-                and _exec_spread <= 0.06
                 and _mode_exec not in ("exit", "trim", "hedge")
+                and _exec_regime in ("CALM", "NORMAL", "HIGH_VOL")
+                and _exec_T > 35.0
+                and _exec_spread <= 0.10
             )
 
             if _use_adaptive:
@@ -2232,10 +2309,21 @@ async def execution_loop() -> None:
 
                 _fill_price = float(fok_result.get("used_limit", limit_price))
                 _fill_size  = float(fok_result.get("used_size", size))
+                _sig_edge = float(payload.get("edge", 0.0) or 0.0)
+                _book_fee = float(fee_per_share(_fill_price))
+                _realized_edge = float((payload.get("p_cone", 0.5) if side == "UP" else (1.0 - float(payload.get("p_cone", 0.5)))) - (_fill_price + _book_fee))
+                _edge_leak = (_sig_edge - _realized_edge) if _sig_edge > 1e-9 else 0.0
+                _edge_leak_ratio = (_edge_leak / _sig_edge) if _sig_edge > 1e-9 else 0.0
                 logger.info(
                     f"ORDER_FILLED({_exec_method}): {side} {order_side} "
-                    f"{_fill_size}@{_fill_price:.2f} exec_ms={fok_result['exec_ms']}"
+                    f"{_fill_size}@{_fill_price:.2f} exec_ms={fok_result['exec_ms']} "
+                    f"edge_sig={_sig_edge:.4f} edge_real={_realized_edge:.4f} leakage={_edge_leak_ratio:.2%}"
                 )
+                if _edge_leak_ratio > EXEC_LEAKAGE_WARN:
+                    logger.warning(
+                        f"EXEC_LEAK_WARN: leakage={_edge_leak_ratio:.2%} > {EXEC_LEAKAGE_WARN:.0%} "
+                        f"method={_exec_method} spread={_exec_spread:.3f}"
+                    )
 
                 # FIFO portfolio accounting (truth)
                 _fill_pos = pos_for_token(token_id)
@@ -4274,6 +4362,18 @@ async def brain_loop(eq: asyncio.Queue) -> None:
                 f"basis={BASIS.rolling_basis:+.2f} basis_std={BASIS.basis_stdev:.2f}"
             )
 
+        _sig_spread = max(up_sp, dn_sp)
+        _sig_lag_p50 = float(LAG_ADAPTIVE.p50_ms("UP"))
+        _sig_sigma_ratio = float(STATE.sigma_fast / STATE.sigma_slow) if STATE.sigma_slow > 1e-10 else 1.0
+        _up_cal = state_calibration_adjustments(
+            side="UP", sec_remaining=STATE.sec_remaining, spread=_sig_spread,
+            lag_p50_ms=_sig_lag_p50, sigma_ratio=_sig_sigma_ratio,
+        )
+        _dn_cal = state_calibration_adjustments(
+            side="DOWN", sec_remaining=STATE.sec_remaining, spread=_sig_spread,
+            lag_p50_ms=_sig_lag_p50, sigma_ratio=_sig_sigma_ratio,
+        )
+
         side, token, limit_price, size, debug = decide_edge(
             btc_price=btc_for_edge, open_price=STATE.open_price,
             sec_remaining=STATE.sec_remaining, sigma_1m=STATE.sigma_1m,
@@ -4296,12 +4396,36 @@ async def brain_loop(eq: asyncio.Queue) -> None:
             cb_lead_agrees=bool(_cb_lead_info.get("direction_agrees", False)),
             cb_anticipation=bool(_cb_lead_info.get("anticipation_active", False)),
             basis_shrinking=bool(BASIS.rolling_basis != 0 and abs(BASIS.rolling_basis) < abs(getattr(BASIS, '_prev_basis', BASIS.rolling_basis))),
+            up_edge_boost=float(_up_cal["edge_boost"]),
+            down_edge_boost=float(_dn_cal["edge_boost"]),
+            up_min_p_shift=float(_up_cal["min_p_shift"]),
+            down_min_p_shift=float(_dn_cal["min_p_shift"]),
+            up_max_pay_shift=float(_up_cal["max_pay_shift"]),
+            down_max_pay_shift=float(_dn_cal["max_pay_shift"]),
+            top_depth=float(max(
+                up_snap.best_bid_size + up_snap.best_ask_size,
+                dn_snap.best_bid_size + dn_snap.best_ask_size,
+            )),
         )
 
         debug["oracle_source"] = oracle_src
         if implied_up or implied_dn:
             debug["implied_side"] = "UP" if implied_up else "DN"
         LATEST_DEBUG.update(debug)
+
+        _t_bucket = "20_60" if STATE.sec_remaining <= 60 else ("60_120" if STATE.sec_remaining <= 120 else "120_240")
+        _dbg_side = str(debug.get("side") or side or "NA")
+        log_calibration_sample(
+            side=_dbg_side,
+            t_bucket=_t_bucket,
+            spread=max(up_sp, dn_sp),
+            lag_ms=float(LAG_ADAPTIVE.p50_ms(_dbg_side if _dbg_side in ("UP", "DOWN") else "UP")),
+            sigma_ratio=_sig_sigma_ratio,
+            edge=float(debug.get("edge", 0.0) or 0.0),
+            p_token=float(debug.get("p_token", 0.0) or 0.0),
+            ask=float(limit_price or 0.0),
+            reason=str(debug.get("reason", "")),
+        )
 
         # ── Coinbase direction agreement safety gate ──────────────────
         if (side is not None and
@@ -4752,6 +4876,10 @@ async def brain_loop(eq: asyncio.Queue) -> None:
         debug["slippage"] = _fp["slippage"]
         debug["fill_kelly"] = _fill_kelly
 
+        _lag_q = float(LAG_ADAPTIVE.p50_ms(side if side in ("UP", "DOWN") else "UP"))
+        _q_score = quality_score(float(edge_val), float(_spread_for_fill), float(_fp["p_fill"]), _lag_q)
+        debug["quality_score"] = round(_q_score, 3)
+
         _late_kelly = debug.get("late_kelly_mult", 1.0)
         _spread_mult = debug.get("spread_size_mult", 1.0)
         _exec_mult = _fill_kelly * min(_spread_mult, _late_kelly)
@@ -4782,6 +4910,22 @@ async def brain_loop(eq: asyncio.Queue) -> None:
         f_used = max(0.0, min(1.0, _kelly_L4))
         if _kelly_raw > 0:
             f_used = max(f_used, 0.03 * _kelly_raw)  # elasticity floor
+
+        # Quality-conditioned Kelly bands: allocate more to top-quality shots,
+        # clamp marginal setups even when upstream multipliers are permissive.
+        if _q_score >= 0.78:
+            _q_floor = min(1.0, max(0.0, 0.10 * _kelly_raw))
+            _q_cap = 1.00
+        elif _q_score <= 0.45:
+            _q_floor = 0.0
+            _q_cap = 0.65
+        else:
+            _q_floor = min(1.0, max(0.0, 0.04 * _kelly_raw))
+            _q_cap = 0.85
+        f_used = max(_q_floor, min(_q_cap, f_used))
+        debug["kelly_q_floor"] = round(_q_floor, 5)
+        debug["kelly_q_cap"] = round(_q_cap, 5)
+
         f_used = min(1.0, f_used)
 
         debug["kelly_post_filters"] = round(f_used, 5)
