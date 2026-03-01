@@ -15,6 +15,7 @@ Key components:
 
 import time
 import math
+import os
 from math import erfc
 import logging
 import numpy as np
@@ -427,6 +428,10 @@ class MispricingConfig:
     kelly_fraction: float = 0.10        # 10% Kelly default
     kelly_max: float = 0.03             # cap: 3% bankroll per shot
 
+    # Side-specific asymmetry knobs
+    down_edge_mult: float = 1.10        # DOWN requires slightly more edge by default
+    up_edge_mult: float = 1.00
+
 
 def _phi(z: float) -> float:
     """Standard normal CDF using erfc (no scipy)."""
@@ -452,6 +457,9 @@ def mispricing_sniper(
     cb_lead_agrees: bool = False,   # CB Lead direction agrees with signal
     cb_anticipation: bool = False,  # CB Lead anticipation mode active
     basis_shrinking: bool = False,  # Coinbase-Poly basis converging
+    edge_boost: float = 0.0,         # dynamic edge override from runtime calibration
+    min_p_shift: float = 0.0,        # dynamic min_p shift from runtime calibration
+    max_pay_shift: float = 0.0,      # dynamic max_pay shift from runtime calibration
     cfg: MispricingConfig = None,
 ) -> dict:
     """
@@ -475,6 +483,7 @@ def mispricing_sniper(
     # ── Volatility-adjusted min_p ──
     P_sigma = percentile_rank(sigma_eff, _SIGMA_HISTORY) if _SIGMA_HISTORY else 0.5
     min_p_dyn = cfg.min_p + cfg.min_p_vol_boost * (1.0 - P_sigma)
+    min_p_dyn += float(min_p_shift)
     min_p_dyn = min(cfg.min_p_max, max(cfg.min_p_min, min_p_dyn))
 
     # ── CB Lead agreement bonus: relax p threshold when Coinbase confirms ──
@@ -506,6 +515,8 @@ def mispricing_sniper(
 
     # 4) Edge target (late window stricter)
     edge_target = cfg.edge_target_late if T_sec <= cfg.late_T_sec else cfg.edge_target_base
+    edge_target *= (cfg.up_edge_mult if side == "UP" else cfg.down_edge_mult)
+    edge_target += float(edge_boost)
 
     # 5) Soft p gate: only enforce probability dominance if edge isn't already strong
     #    Cheap asks (big edge) → let lower p through.
@@ -526,6 +537,7 @@ def mispricing_sniper(
     _z_scale = min(1.0, abs(z_ema) / 2.0)
     _dynamic_cap = 0.70 + 0.10 * _z_scale
     max_pay_regime = cfg.max_pay_late if T_sec <= cfg.late_T_sec else cfg.max_pay_default
+    max_pay_regime = min(0.95, max(0.50, max_pay_regime + float(max_pay_shift)))
     max_pay = min(max_pay_regime, _dynamic_cap)
     max_pay = min(max_pay, max(0.01, p_token - cfg.edge_buffer))
 
@@ -584,10 +596,14 @@ MIS_CFG = MispricingConfig()
 _LAST_SNIPER_FIRE_TS: int = 0
 _SNIPER_COOLDOWN_MS: int = 3000
 
-# ── Directional lock: one entry per side per window ─────────────────────
+# ── Directional lock + micro-burst controls ──────────────────────────────
 _LAST_SNIPER_SIDE: Optional[str] = None
 _LAST_SNIPER_WINDOW: Optional[float] = None   # keyed by open_price
 _Z_RESET_THRESHOLD: float = 0.6               # Z must collapse before flip
+_MAX_SNIPER_FIRES_PER_SIDE: int = int(os.getenv("MAX_SNIPER_FIRES_PER_SIDE", "3"))
+_MICRO_BURST_MIN_EDGE: float = float(os.getenv("MICRO_BURST_MIN_EDGE", "0.03"))
+_MICRO_BURST_MIN_DEPTH: float = float(os.getenv("MICRO_BURST_MIN_DEPTH", "30.0"))
+_WINDOW_SIDE_FIRE_COUNT: dict = {}
 
 
 def confirm_sniper_fire() -> None:
@@ -600,9 +616,10 @@ def confirm_sniper_fire() -> None:
 def reset_sniper_lock() -> None:
     """Clear the one-shot sniper lock so the same side can fire again.
     Call this when a FOK order misses or is rejected (NON_MARKETABLE)."""
-    global _LAST_SNIPER_SIDE, _LAST_SNIPER_WINDOW
+    global _LAST_SNIPER_SIDE, _LAST_SNIPER_WINDOW, _WINDOW_SIDE_FIRE_COUNT
     _LAST_SNIPER_SIDE = None
     _LAST_SNIPER_WINDOW = None
+    _WINDOW_SIDE_FIRE_COUNT = {}
 
 
 def ms_now() -> int:
@@ -1089,6 +1106,11 @@ def decide_edge(
     cand = []
     for s in ("UP", "DOWN"):
         _ask = up_ask if s == "UP" else down_ask
+        _side_l = str(s).upper()
+        _edge_boost = float(kw.get("up_edge_boost", 0.0) if _side_l == "UP" else kw.get("down_edge_boost", 0.0))
+        _min_p_shift = float(kw.get("up_min_p_shift", 0.0) if _side_l == "UP" else kw.get("down_min_p_shift", 0.0))
+        _max_pay_shift = float(kw.get("up_max_pay_shift", 0.0) if _side_l == "UP" else kw.get("down_max_pay_shift", 0.0))
+
         res = mispricing_sniper(
             side=s,
             p_cone=p,
@@ -1107,6 +1129,9 @@ def decide_edge(
             cb_lead_agrees=bool(kw.get("cb_lead_agrees", False)),
             cb_anticipation=bool(kw.get("cb_anticipation", False)),
             basis_shrinking=bool(kw.get("basis_shrinking", False)),
+            edge_boost=_edge_boost,
+            min_p_shift=_min_p_shift,
+            max_pay_shift=_max_pay_shift,
             cfg=MIS_CFG,
         )
         res["side"] = s
@@ -1143,10 +1168,23 @@ def decide_edge(
 
     # ── Directional lock: one entry per side per window ──
     current_window = window_key if window_key is not None else int(open_price * 100)  # fallback
-    if (_LAST_SNIPER_WINDOW == current_window and
-            _LAST_SNIPER_SIDE == side):
-        debug["reason"] = "already_fired_this_side"
+    _side_key = (current_window, side)
+    _fire_count = int(_WINDOW_SIDE_FIRE_COUNT.get(_side_key, 0))
+    _top_depth = float(kw.get("top_depth", 0.0) or 0.0)
+    if _fire_count >= _MAX_SNIPER_FIRES_PER_SIDE:
+        debug["reason"] = "micro_burst_side_cap"
         debug["side"] = side
+        debug["side_fires"] = _fire_count
+        return None, None, None, 0.0, debug
+    if _fire_count > 0 and best["edge"] < _MICRO_BURST_MIN_EDGE:
+        debug["reason"] = "micro_burst_requal_edge"
+        debug["edge"] = best["edge"]
+        debug["edge_need"] = _MICRO_BURST_MIN_EDGE
+        return None, None, None, 0.0, debug
+    if _fire_count > 0 and _top_depth < _MICRO_BURST_MIN_DEPTH:
+        debug["reason"] = "micro_burst_requal_depth"
+        debug["top_depth"] = _top_depth
+        debug["depth_need"] = _MICRO_BURST_MIN_DEPTH
         return None, None, None, 0.0, debug
 
     # ── Z-reset guard: require Z collapse before flipping direction ──
@@ -1171,6 +1209,7 @@ def decide_edge(
     # Commit side/window lock (cooldown timestamp set by caller after order placed)
     _LAST_SNIPER_SIDE = side
     _LAST_SNIPER_WINDOW = current_window
+    _WINDOW_SIDE_FIRE_COUNT[_side_key] = _fire_count + 1
     size = SIZE_SHARES
 
     # TRINITY diagnostic (v2: includes Kelly + vol-adjusted fields)
@@ -1203,5 +1242,7 @@ def decide_edge(
         "kelly_frac": best.get("kelly_frac", 0.0),
         "min_p_dyn": best.get("min_p_dyn", 0.0),
         "P_sigma": best.get("P_sigma", 0.0),
+        "side_fires": _WINDOW_SIDE_FIRE_COUNT.get(_side_key, 1),
+        "max_side_fires": _MAX_SNIPER_FIRES_PER_SIDE,
     })
     return side, None, float(limit_price), float(size), debug

@@ -31,7 +31,7 @@ import time
 import logging
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Literal, Dict, Any
+from typing import Optional, Literal, Dict, Any, Callable
 
 from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -341,6 +341,11 @@ class AdaptiveExecutor:
 
         self.cross_cooldown: int = 0
         self.consecutive_losses: int = 0
+        self.toxic_abort_fn: Optional[Callable[[str, str], bool]] = None
+
+    def set_toxic_abort_fn(self, fn: Optional[Callable[[str, str], bool]]) -> None:
+        """Optional callback(side, token_id)->bool to abort resting maker orders on toxic flow."""
+        self.toxic_abort_fn = fn
 
     # ─────────────────────────────────────────────────────────────────────
     # Main entry point (called from execution_loop via thread_pool)
@@ -720,7 +725,19 @@ class AdaptiveExecutor:
         if not oid:
             return None, False, 0.0
 
-        time.sleep(ttl_ms / 1000.0)
+        _deadline = time.time() + ttl_ms / 1000.0
+        while time.time() < _deadline:
+            if self.toxic_abort_fn is not None:
+                try:
+                    if self.toxic_abort_fn(str(side), str(token_id)):
+                        self._clob_cancel(oid)
+                        logger.info(
+                            f"MAKER_TOXIC_ABORT: oid={oid} side={side} token={token_id[:12]}..."
+                        )
+                        return oid, False, 0.0
+                except Exception as _te:
+                    logger.debug(f"TOXIC_ABORT_CHECK_ERR: {_te}")
+            time.sleep(0.05)
 
         filled, matched = self._clob_check_filled(oid)
         if filled:
