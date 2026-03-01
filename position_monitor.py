@@ -69,8 +69,8 @@ class PositionMonitorConfig:
     trail_activation_profit: float = 0.03  # minimum profit to activate trailing
 
     # ── Trailing stop flicker guard ──
-    trail_persistence_ms: int = 500    # bid must stay below trail for this long
-    trail_min_spread: float = 0.08     # don't trail-stop on wide/illiquid books
+    trail_persistence_ms: int = 300    # bid must stay below trail for this long
+    trail_min_spread: float = 0.10     # max spread allowed for trailing stop fire
 
     # ── Endgame (subsumes EndgameManager) ──
     endgame_T: float = 25.0
@@ -278,7 +278,7 @@ class PositionMonitor:
         # ── 4. TRAILING STOP (only in gamma band) ──
         # Prevents giving back gains in the uncertainty zone.
         # Flicker guard: bid must stay below trail level for
-        # trail_persistence_ms AND book must not be illiquid.
+        # trail_persistence_ms AND spread sanity must hold (avoid flicker/liquidity vacuums).
         if in_gamma and self._trail_activated.get(side, False):
             trail_offset = self._interpolate_by_time(
                 T_sec, cfg.trail_offset_early, cfg.trail_offset_late,

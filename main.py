@@ -502,11 +502,12 @@ def settle_window():
             _sp_model = ENTRY_P_CONE.get(_sprt_side)
             _sp_market = ENTRY_P_MARKET.get(_sprt_side)
             if _sp_model is not None and _sp_market is not None:
-                # p_model/p_market are for the UP side; adjust for DOWN
-                if _sprt_side == "DOWN":
-                    _sp_model = 1.0 - _sp_model if ENTRY_P_CONE.get("DOWN") is None else _sp_model
-                    _sp_market = 1.0 - _sp_market if ENTRY_P_MARKET.get("DOWN") is None else _sp_market
-                SPRT.record(p_model=_sp_model, p_market=_sp_market, outcome=_sprt_won)
+                # Compare model vs market midpoint for the SAME traded side.
+                SPRT.record(
+                    p_model=max(0.0, min(1.0, float(_sp_model))),
+                    p_market=max(0.0, min(1.0, float(_sp_market))),
+                    outcome=_sprt_won,
+                )
         logger.info(
             f"SPRT: recorded {'WIN' if won else 'LOSS'} → {SPRT.decision} "
             f"(lr={SPRT._log_lr:.3f} brier_m={SPRT.avg_brier_model:.4f} "
@@ -932,6 +933,32 @@ def quality_score(edge: float, spread: float, p_fill: float, lag_p50_ms: float) 
     return 0.40 * e + 0.20 * sp + 0.25 * pf + 0.15 * lag
 
 
+def depth_decayed_imbalance(bids: list, asks: list, mid: float, *, k: float = 0.90, tick_size: float = 0.01) -> float:
+    """Anti-spoofing imbalance: exponentially downweights depth away from mid."""
+    if not bids and not asks:
+        return 0.0
+
+    def _w_sum(levels: list) -> float:
+        s = 0.0
+        for px, sz in levels:
+            try:
+                p = float(px)
+                q = max(0.0, float(sz))
+            except Exception:
+                continue
+            dist_ticks = abs(p - mid) / max(1e-9, tick_size)
+            w = math.exp(-k * dist_ticks)
+            s += q * w
+        return s
+
+    wb = _w_sum(bids)
+    wa = _w_sum(asks)
+    tot = wb + wa
+    if tot <= 1e-9:
+        return 0.0
+    return max(-1.0, min(1.0, (wb - wa) / tot))
+
+
 def log_calibration_sample(*, side: str, t_bucket: str, spread: float, lag_ms: float,
                            sigma_ratio: float, edge: float, p_token: float,
                            ask: float, reason: str) -> None:
@@ -1255,6 +1282,22 @@ execution_queue: asyncio.Queue      = asyncio.Queue()
 # Initialize AdaptiveExecutor with client
 if client is not None:
     ADAPTIVE_EXEC = AdaptiveExecutor(client)
+
+    def _toxic_maker_abort(side: str, token_id: str) -> bool:
+        """Abort resting maker orders when flow regime flips toxic."""
+        try:
+            _label = str(getattr(REGIME, "label", "NORMAL") or "NORMAL")
+            if _label in ("BURST", "FAST_TAIL", "PANIC", "ADVERSARIAL"):
+                return True
+            if float(getattr(REGIME, "flip_rate", 0.0) or 0.0) > 0.12:
+                return True
+            if side in ("UP", "DOWN") and LAG_ADAPTIVE.fast_tail_active(side):
+                return True
+        except Exception:
+            return False
+        return False
+
+    ADAPTIVE_EXEC.set_toxic_abort_fn(_toxic_maker_abort)
     logger.info("AdaptiveExecutor initialized (maker routing available)")
 else:
     logger.warning("AdaptiveExecutor NOT initialized (no client)")
@@ -2199,6 +2242,15 @@ async def execution_loop() -> None:
                     _ms.best_ask_sz = float(getattr(_exec_snap, 'best_ask_size', 50.0))
                 _ms.sigma = float(STATE.sigma_1m)
                 _ms.trade_vel = float(getattr(FLOW, '_fills', deque()) and len(FLOW._fills) / 30.0 or 1.0)
+                _ps = POLY_STATE.get(token_id, {}) if token_id else {}
+                _mid = 0.5 * (_ms.best_bid + _ms.best_ask)
+                _bids_l2 = list(_ps.get("bids_l2", []))
+                _asks_l2 = list(_ps.get("asks_l2", []))
+                if not _bids_l2:
+                    _bids_l2 = [(_ms.best_bid, _ms.best_bid_sz)]
+                if not _asks_l2:
+                    _asks_l2 = [(_ms.best_ask, _ms.best_ask_sz)]
+                _ms.imbalance = float(depth_decayed_imbalance(_bids_l2, _asks_l2, _mid))
                 _ms.flow_bias = float(FLOW.imbalance(
                     up_price=_ms.best_bid if side == "UP" else 0.5,
                     down_price=_ms.best_bid if side == "DOWN" else 0.5,
@@ -2452,7 +2504,9 @@ def _process_book_update(msg: dict) -> bool:
                 "bid_size": 0.0,
                 "ask_size": 0.0,
                 "last_update": 0,
-                "source": "ws"
+                "source": "ws",
+                "bids_l2": [],
+                "asks_l2": [],
             }
 
         state = POLY_STATE[tid]
@@ -2499,7 +2553,15 @@ def _process_book_update(msg: dict) -> bool:
                 if asks:
                     state["ask"] = float(asks[0]["price"])
                     state["ask_size"] = float(asks[0].get("size", 0))
-            except (IndexError, KeyError, ValueError):
+                state["bids_l2"] = [
+                    (float(x.get("price", 0.0)), float(x.get("size", 0.0)))
+                    for x in bids[:5]
+                ]
+                state["asks_l2"] = [
+                    (float(x.get("price", 1.0)), float(x.get("size", 0.0)))
+                    for x in asks[:5]
+                ]
+            except (IndexError, KeyError, ValueError, TypeError):
                 pass
 
             state["last_update"] = now
